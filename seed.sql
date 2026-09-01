@@ -1,3 +1,4 @@
+-- Active: 1786790406134@@localhost@3306@student_api
 USE student_api;
 
 INSERT INTO students (name, major, email) VALUES

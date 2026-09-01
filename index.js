@@ -8,6 +8,13 @@ const { graphqlHTTP } = require("express-graphql");
 const schema = require("./schema");
 const root = require("./resolvers");
 const pool = require("./db");
+const { redisClient, connectRedis } = require("./cache");
+const {
+  parsePagination,
+  parseSort,
+  deprecationWarning,
+} = require("./middlewares/query-parser");
+const { authenticateToken, authorizeRole } = require("./middlewares/auth");
 const {
   hashPassword,
   verifyPassword,
@@ -37,24 +44,83 @@ app.use(
   }),
 );
 
-// url endpointสำหรับตรวจสอบสถานะ API
+// url endpoint สำหรับตรวจสอบสถานะ API
 app.get("/", (req, res) => {
   res.status(200).json({ message: "Student API พร้อมใช้งาน" });
 });
 
-// 1. GET: ดึงรายการนักศึกษาทั้งหมด
-app.get("/api/v1/students/", async (req, res, next) => {
-  try {
-    const [rows] = await pool.query("SELECT * FROM students");
-    res.status(200).json({ message: "สำเร็จ", data: rows });
-  } catch (err) {
-    next(err);
-  }
-});
+// =====================================================================
+// API v1 Router
+// =====================================================================
+const v1Router = express.Router();
+
+// [แบบฝึกหัดต่อยอดข้อ 3] แนบ Header Deprecation และ Link ไปยัง v2 อัตโนมัติทุก route ใน v1
+v1Router.use(deprecationWarning);
+
+// 1. GET: ดึงรายการนักศึกษาทั้งหมด พร้อม Dynamic Cache Key, Pagination, Filtering, Sorting
+v1Router.get(
+  "/students",
+  parsePagination,
+  parseSort,
+  async (req, res, next) => {
+    const { major } = req.query;
+    const { page, limit, offset } = req.pagination;
+    const { field, order } = req.sort;
+
+    // [แบบฝึกหัดต่อยอดข้อ 2] ออกแบบ Cache Key ที่รวมพารามิเตอร์การค้นหาทั้งหมด
+    const cacheKey = `students:page=${page}:limit=${limit}:major=${major || "all"}:sort=${field}:order=${order}`;
+
+    try {
+      // ตรวจสอบข้อมูลใน Cache ก่อน
+      const cachedData = await redisClient.get(cacheKey);
+      if (cachedData) {
+        return res.status(200).json({
+          message: "สำเร็จ (จาก cache)",
+          ...JSON.parse(cachedData),
+        });
+      }
+
+      let baseQuery = "SELECT * FROM students";
+      let countQuery = "SELECT COUNT(*) AS total FROM students";
+      const params = [];
+
+      if (major) {
+        baseQuery += " WHERE major = ?";
+        countQuery += " WHERE major = ?";
+        params.push(major);
+      }
+
+      // แทรก field/order ลง SQL ได้โดยตรงเฉพาะเพราะผ่าน allowlist ใน parseSort มาแล้ว
+      baseQuery += ` ORDER BY ${field} ${order} LIMIT ? OFFSET ?`;
+
+      const [rows] = await pool.query(baseQuery, [...params, limit, offset]);
+      const [[{ total }]] = await pool.query(countQuery, params);
+
+      const responsePayload = {
+        data: rows,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      };
+
+      // บันทึกผลลัพธ์ลง Cache (TTL 60 วินาที)
+      await redisClient.setEx(cacheKey, 60, JSON.stringify(responsePayload));
+
+      res.status(200).json({
+        message: "สำเร็จ (จากฐานข้อมูล)",
+        ...responsePayload,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 // 2. GET: ดึงข้อมูลนักศึกษารายบุคคลตาม id
-//    รองรับ ?include=courses ด้วยการ JOIN ผ่านตาราง enrollments แทนฟิลด์ courseIds เดิม
-app.get("/api/v1/students/:id", async (req, res, next) => {
+v1Router.get("/students/:id", async (req, res, next) => {
   try {
     const [rows] = await pool.query("SELECT * FROM students WHERE id = ?", [
       req.params.id,
@@ -88,8 +154,8 @@ app.get("/api/v1/students/:id", async (req, res, next) => {
   }
 });
 
-// 3. POST: เพิ่มข้อมูลนักศึกษาใหม่
-app.post("/api/v1/students", async (req, res, next) => {
+// 3. POST: เพิ่มข้อมูลนักศึกษาใหม่ พร้อมล้าง Cache แบบกวาดล้างทุกเงื่อนไข (students:*)
+v1Router.post("/students", async (req, res, next) => {
   const { name, major, email } = req.body;
 
   if (!name || !major || !email) {
@@ -106,6 +172,13 @@ app.post("/api/v1/students", async (req, res, next) => {
       "INSERT INTO students (name, major, email) VALUES (?, ?, ?)",
       [name, major, email],
     );
+
+    // [แบบฝึกหัดต่อยอดข้อ 2] ค้นหาและลบ Cache ทุกตัวที่ขึ้นต้นด้วย students:*
+    const keys = await redisClient.keys("students:*");
+    if (keys.length > 0) {
+      await redisClient.del(keys);
+    }
+
     res.status(201).json({
       message: "เพิ่มข้อมูลสำเร็จ",
       data: { id: result.insertId, name, major, email },
@@ -120,8 +193,8 @@ app.post("/api/v1/students", async (req, res, next) => {
   }
 });
 
-// 4. PUT: แก้ไขข้อมูลนักศึกษาทั้งระเบียน (name, major)
-app.put("/api/v1/students/:id", async (req, res, next) => {
+// 4. PUT: แก้ไขข้อมูลนักศึกษาทั้งระเบียน
+v1Router.put("/students/:id", async (req, res, next) => {
   const { name, major } = req.body;
 
   if (!name || !major) {
@@ -155,8 +228,8 @@ app.put("/api/v1/students/:id", async (req, res, next) => {
   }
 });
 
-// Patch: อัปเดตเฉพาะฟิลด์ที่ส่งมา ฟิลด์อื่นคงค่าเดิมไว้
-app.patch("/api/v1/students/:id", async (req, res, next) => {
+// Patch: อัปเดตเฉพาะฟิลด์ที่ส่งมา
+v1Router.patch("/students/:id", async (req, res, next) => {
   const { name, major, email } = req.body;
 
   if (name === undefined && major === undefined && email === undefined) {
@@ -207,11 +280,9 @@ app.patch("/api/v1/students/:id", async (req, res, next) => {
   }
 });
 
-// 5. DELETE: ลบข้อมูลนักศึกษา
-const { authenticateToken, authorizeRole } = require("./middlewares/auth");
-
-app.delete(
-  "/api/v1/students/:id",
+// 5. DELETE: ลบข้อมูลนักศึกษา (เฉพาะ admin)
+v1Router.delete(
+  "/students/:id",
   authenticateToken,
   authorizeRole("admin"),
   async (req, res, next) => {
@@ -231,14 +302,13 @@ app.delete(
   },
 );
 
-// เพิ่ม route ใหม่: เฉพาะผู้ที่ล็อกอินแล้วเท่านั้นที่ดูข้อมูลของตนเองได้
-app.get("/api/v1/auth/me", authenticateToken, (req, res) => {
+// ข้อมูลผู้ใช้งานที่ล็อกอิน
+v1Router.get("/auth/me", authenticateToken, (req, res) => {
   res.status(200).json({ message: "สำเร็จ", data: req.user });
 });
 
-// ===== Route: ลงทะเบียนเรียนด้วย Transaction (ขั้นตอนที่ 3.3) =====
-
-app.post("/api/v1/students/:id/enrollments", async (req, res, next) => {
+// ลงทะเบียนเรียนด้วย Transaction
+v1Router.post("/students/:id/enrollments", async (req, res, next) => {
   const studentId = req.params.id;
   const { courseId } = req.body;
   const connection = await pool.getConnection();
@@ -293,9 +363,8 @@ app.post("/api/v1/students/:id/enrollments", async (req, res, next) => {
   }
 });
 
-// ===== Auth: Register/Login (wk06) =====
-
-app.post("/api/v1/auth/register", async (req, res, next) => {
+// Auth: Register / Login
+v1Router.post("/auth/register", async (req, res, next) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -328,7 +397,7 @@ app.post("/api/v1/auth/register", async (req, res, next) => {
   }
 });
 
-app.post("/api/v1/auth/login", async (req, res, next) => {
+v1Router.post("/auth/login", async (req, res, next) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -373,9 +442,8 @@ app.post("/api/v1/auth/login", async (req, res, next) => {
   }
 });
 
-// ===== แบบฝึกหัดที่ 1: ดึงรายวิชาที่นักศึกษาลงทะเบียนด้วย JOIN =====
-
-app.get("/api/v1/students/:id/courses", async (req, res, next) => {
+// ดึงรายวิชาที่นักศึกษาลงทะเบียน
+v1Router.get("/students/:id/courses", async (req, res, next) => {
   try {
     const [rows] = await pool.query(
       `SELECT courses.* FROM courses
@@ -389,108 +457,59 @@ app.get("/api/v1/students/:id/courses", async (req, res, next) => {
   }
 });
 
-// ===== แบบฝึกหัดที่ 2: เวอร์ชันไม่ใช้ Transaction (สำหรับทดลอง/เปรียบเทียบ) =====//
-
-app.post("/api/v1/students/:id/enrollments-unsafe", async (req, res, next) => {
-  const studentId = req.params.id;
-  const { courseId } = req.body;
-
+// [แบบฝึกหัดต่อยอดข้อ 1] GET /courses พร้อม Caching (TTL 300 วินาที)
+v1Router.get("/courses", async (req, res, next) => {
+  const cacheKey = "courses:all";
   try {
-    const [courseRows] = await pool.query(
-      "SELECT * FROM courses WHERE id = ?",
-      [courseId],
-    );
-
-    if (courseRows.length === 0) {
-      return res.status(404).json({
-        error: { code: "COURSE_NOT_FOUND", message: "ไม่พบรายวิชาที่ระบุ" },
+    const cachedData = await redisClient.get(cacheKey);
+    if (cachedData) {
+      return res.status(200).json({
+        message: "สำเร็จ (จาก cache)",
+        data: JSON.parse(cachedData),
       });
     }
 
-    if (courseRows[0].seat_available <= 0) {
-      return res.status(409).json({
-        error: { code: "SEAT_FULL", message: "ที่นั่งเต็มแล้ว" },
-      });
-    }
+    const [rows] = await pool.query("SELECT * FROM courses");
+    await redisClient.setEx(cacheKey, 300, JSON.stringify(rows));
 
-    // ไม่มี transaction คลุมสองคำสั่งนี้ไว้ด้วยกัน
-    await pool.query(
-      "INSERT INTO enrollments (student_id, course_id) VALUES (?, ?)",
-      [studentId, courseId],
-    );
-
-    await pool.query(
-      "UPDATE courses SET seat_available = seat_available - 1 WHERE id = ?",
-      [courseId],
-    );
-
-    res.status(201).json({ message: "ลงทะเบียนสำเร็จ (unsafe)" });
+    res.status(200).json({
+      message: "สำเร็จ (จากฐานข้อมูล)",
+      data: rows,
+    });
   } catch (err) {
-    if (err.code === "ER_DUP_ENTRY") {
-      return res.status(409).json({
-        error: {
-          code: "ALREADY_ENROLLED",
-          message: "นักศึกษาลงทะเบียนรายวิชานี้ไปแล้ว",
-        },
-      });
-    }
     next(err);
   }
 });
 
-// ===== แบบฝึกหัดที่ 3: ยกเลิกการลงทะเบียนด้วย Transaction =====
+app.use("/api/v1", v1Router);
 
-app.delete(
-  "/api/v1/students/:id/enrollments/:courseId",
-  async (req, res, next) => {
-    const { id: studentId, courseId } = req.params;
-    const connection = await pool.getConnection();
+// =====================================================================
+// API v2 Router
+// =====================================================================
+const v2Router = express.Router();
 
-    try {
-      await connection.beginTransaction();
+v2Router.get("/students", async (req, res, next) => {
+  try {
+    const [rows] = await pool.query("SELECT * FROM students");
+    res.status(200).json({ items: rows, count: rows.length });
+  } catch (err) {
+    next(err);
+  }
+});
 
-      const [result] = await connection.query(
-        "DELETE FROM enrollments WHERE student_id = ? AND course_id = ?",
-        [studentId, courseId],
-      );
+app.use("/api/v2", v2Router);
 
-      if (result.affectedRows === 0) {
-        await connection.rollback();
-        return res.status(404).json({
-          error: {
-            code: "ENROLLMENT_NOT_FOUND",
-            message: "ไม่พบการลงทะเบียนที่ระบุ",
-          },
-        });
-      }
-
-      await connection.query(
-        "UPDATE courses SET seat_available = seat_available + 1 WHERE id = ?",
-        [courseId],
-      );
-
-      await connection.commit();
-      res.status(200).json({ message: "ยกเลิกการลงทะเบียนสำเร็จ" });
-    } catch (err) {
-      await connection.rollback();
-      next(err);
-    } finally {
-      connection.release();
-    }
-  },
-);
-
-// 404: ไม่พบ route ที่ร้องขอ (ต้องอยู่หลัง route ทั้งหมด)
+// =====================================================================
+// Error Handling & 404
+// =====================================================================
 app.use((req, res) => {
   res.status(404).json({
     error: { code: "ROUTE_NOT_FOUND", message: "ไม่พบเส้นทางที่ร้องขอ" },
   });
 });
 
-// Error-handling middleware (ต้องมีพารามิเตอร์ 4 ตัวเสมอ)
 app.use((err, req, res, next) => {
   console.error(err.stack);
-  // ใช้ err.status/err.statusCode หากมี (เช่น PayloadTooLargeError จาก express.json ที่ส่งมาเป็น 413)
   const statusCode = err.status || err.statusCode || 500;
   res.status(statusCode).json({
     error: {
@@ -503,8 +522,15 @@ app.use((err, req, res, next) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(
-    `Server กำลังทำงานที่ http://localhost:${PORT} (${process.env.NODE_ENV})`,
-  );
-});
+connectRedis()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(
+        `Server กำลังทำงานที่ http://localhost:${PORT} (${process.env.NODE_ENV})`,
+      );
+    });
+  })
+  .catch((err) => {
+    console.error("เชื่อมต่อ Redis ไม่สำเร็จ เซิร์ฟเวอร์จะไม่เริ่มทำงาน:", err);
+    process.exit(1);
+  });
