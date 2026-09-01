@@ -8,6 +8,11 @@ const { graphqlHTTP } = require("express-graphql");
 const schema = require("./schema");
 const root = require("./resolvers");
 const pool = require("./db");
+const {
+  hashPassword,
+  verifyPassword,
+  generateToken,
+} = require("./auth-helpers");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -203,22 +208,32 @@ app.patch("/api/v1/students/:id", async (req, res, next) => {
 });
 
 // 5. DELETE: ลบข้อมูลนักศึกษา
-app.delete("/api/v1/students/:id", async (req, res, next) => {
-  try {
-    const [result] = await pool.query("DELETE FROM students WHERE id = ?", [
-      req.params.id,
-    ]);
+const { authenticateToken, authorizeRole } = require("./middlewares/auth");
 
-    if (result.affectedRows === 0) {
-      return res.status(404).json({
-        error: { code: "NOT_FOUND", message: "ไม่พบข้อมูลนักศึกษา" },
-      });
+app.delete(
+  "/api/v1/students/:id",
+  authenticateToken,
+  authorizeRole("admin"),
+  async (req, res, next) => {
+    try {
+      const [result] = await pool.query("DELETE FROM students WHERE id = ?", [
+        req.params.id,
+      ]);
+      if (result.affectedRows === 0) {
+        return res.status(404).json({
+          error: { code: "NOT_FOUND", message: "ไม่พบข้อมูลนิสิต" },
+        });
+      }
+      res.status(200).json({ message: "ลบข้อมูลสำเร็จ" });
+    } catch (err) {
+      next(err);
     }
+  },
+);
 
-    res.status(200).json({ message: "ลบข้อมูลสำเร็จ" });
-  } catch (err) {
-    next(err);
-  }
+// เพิ่ม route ใหม่: เฉพาะผู้ที่ล็อกอินแล้วเท่านั้นที่ดูข้อมูลของตนเองได้
+app.get("/api/v1/auth/me", authenticateToken, (req, res) => {
+  res.status(200).json({ message: "สำเร็จ", data: req.user });
 });
 
 // ===== Route: ลงทะเบียนเรียนด้วย Transaction (ขั้นตอนที่ 3.3) =====
@@ -275,6 +290,86 @@ app.post("/api/v1/students/:id/enrollments", async (req, res, next) => {
     next(err);
   } finally {
     connection.release();
+  }
+});
+
+// ===== Auth: Register/Login (wk06) =====
+
+app.post("/api/v1/auth/register", async (req, res, next) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "กรุณาระบุ email และ password",
+      },
+    });
+  }
+
+  try {
+    const passwordHash = await hashPassword(password);
+    const [result] = await pool.query(
+      "INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'student')",
+      [email, passwordHash],
+    );
+
+    res.status(201).json({
+      message: "สมัครสมาชิกสำเร็จ",
+      data: { id: result.insertId, email, role: "student" },
+    });
+  } catch (err) {
+    if (err.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({
+        error: { code: "DUPLICATE_EMAIL", message: "อีเมลนี้มีอยู่ในระบบแล้ว" },
+      });
+    }
+    next(err);
+  }
+});
+
+app.post("/api/v1/auth/login", async (req, res, next) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "กรุณาระบุ email และ password",
+      },
+    });
+  }
+
+  try {
+    const [rows] = await pool.query("SELECT * FROM users WHERE email = ?", [
+      email,
+    ]);
+
+    if (rows.length === 0) {
+      return res.status(401).json({
+        error: {
+          code: "INVALID_CREDENTIALS",
+          message: "อีเมลหรือรหัสผ่านไม่ถูกต้อง",
+        },
+      });
+    }
+
+    const user = rows[0];
+    const isPasswordValid = await verifyPassword(password, user.password_hash);
+
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        error: {
+          code: "INVALID_CREDENTIALS",
+          message: "อีเมลหรือรหัสผ่านไม่ถูกต้อง",
+        },
+      });
+    }
+
+    const token = generateToken(user);
+    res.status(200).json({ message: "เข้าสู่ระบบสำเร็จ", token });
+  } catch (err) {
+    next(err);
   }
 });
 
