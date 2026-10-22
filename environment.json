@@ -1,0 +1,20 @@
+{
+  "name": "student-api-dev",
+  "values": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000/api/v1",
+      "enabled": true
+    },
+    {
+      "key": "authToken",
+      "value": "",
+      "enabled": true
+    },
+    {
+      "key": "createdStudentId",
+      "value": "",
+      "enabled": true
+    }
+  ]
+}

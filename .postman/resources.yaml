@@ -1,7 +1,14 @@
 # Use this workspace to collaborate
 workspace:
-  id: ""
+  id: ebf816e2-8ba2-423b-8bed-7d8b6df0d785
 
 localResources:
   collections:
     - ../postman-collection.json
+    - ../postman_collection.json
+    - ../_postman_collection.json
+  environments:
+    - ../environment.json
+  specs:
+    - ../openapi-for-copy.yaml
+    - ../openapi.yaml

@@ -1,0 +1,729 @@
+openapi: 3.0.3
+info:
+  title: Student API
+  description: API สำหรับจัดการข้อมูลนิสิต พัฒนาในรายวิชา 88736065
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Development server
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: "VALIDATION_ERROR"
+            message:
+              type: string
+    Student:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        name:
+          type: string
+          example: "สมชาย ใจดี"
+        major:
+          type: string
+          example: "วิทยาการคอมพิวเตอร์"
+        email:
+          type: string
+          format: email
+          example: "somchai@example.com"
+        user_id:
+          type: integer
+          nullable: true
+    Course:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        course_name:
+          type: string
+          example: "การเขียนโปรแกรมเบื้องต้น"
+        credit:
+          type: integer
+          example: 3
+        seat_available:
+          type: integer
+          example: 30
+paths:
+  /auth/register:
+    post:
+      summary: สมัครสมาชิก (role เป็น student เสมอ)
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  format: password
+      responses:
+        "201":
+          description: สมัครสมาชิกสำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  data:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                      email:
+                        type: string
+                      role:
+                        type: string
+                        example: student
+        "400":
+          description: ข้อมูลไม่ครบถ้วน (VALIDATION_ERROR)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: email ซ้ำกับที่มีอยู่แล้ว (DUPLICATE_EMAIL)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/login:
+    post:
+      summary: เข้าสู่ระบบและรับ JWT token
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  format: password
+      responses:
+        "200":
+          description: เข้าสู่ระบบสำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  token:
+                    type: string
+        "400":
+          description: ข้อมูลไม่ครบถ้วน (VALIDATION_ERROR)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: email หรือ password ไม่ถูกต้อง (INVALID_CREDENTIALS)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/me:
+    get:
+      summary: ดูข้อมูลผู้ใช้ปัจจุบันจาก token
+      tags: [Auth]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  data:
+                    type: object
+        "401":
+          description: ไม่มี token หรือ token ไม่ถูกต้อง (NO_TOKEN / INVALID_TOKEN)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /students:
+    get:
+      summary: รายการนิสิตทั้งหมด (รองรับ pagination, filtering, sorting)
+      description: >
+        คืนรายการนิสิตพร้อม pagination โดยผลลัพธ์ถูก cache ไว้ใน Redis (ตามที่ทำไว้ในสัปดาห์ที่ 7)
+        นาน 60 วินาที ต่อชุดพารามิเตอร์ (page, limit, major, sort, order) แต่ละชุดมี cache key แยกกัน
+        เพื่อไม่ให้ผลลัพธ์จากเงื่อนไขต่างกันปนกัน ระบบไม่มี response header แจ้งสถานะ cache hit/miss
+        แยกต่างหาก แต่สามารถสังเกตได้จากค่า `message` ที่คืนกลับ: "สำเร็จ (จาก cache)" หมายถึง cache hit
+        และ "สำเร็จ (จากฐานข้อมูล)" หมายถึง cache miss (query ฐานข้อมูลจริงแล้วบันทึกลง cache)
+      tags: [Students]
+      parameters:
+        - name: page
+          in: query
+          description: หมายเลขหน้าที่ต้องการ เริ่มจาก 1
+          required: false
+          example: 1
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          description: จำนวนรายการต่อหน้า สูงสุด 100 รายการ
+          required: false
+          example: 10
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 10
+        - name: major
+          in: query
+          description: กรองตามสาขาวิชา (exact match)
+          required: false
+          example: "วิทยาการคอมพิวเตอร์"
+          schema:
+            type: string
+        - name: sort
+          in: query
+          description: ฟิลด์ที่ใช้เรียงลำดับ (ค่านอก allowlist จะถูกละเว้นแล้วใช้ id แทน)
+          required: false
+          example: "name"
+          schema:
+            type: string
+            enum: [id, name, major, created_at]
+            default: id
+        - name: order
+          in: query
+          description: ทิศทางการเรียงลำดับ
+          required: false
+          example: "desc"
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: asc
+      responses:
+        "200":
+          description: สำเร็จ (ระบุใน message ว่ามาจาก cache หรือฐานข้อมูล)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "สำเร็จ (จากฐานข้อมูล)"
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Student"
+                  pagination:
+                    type: object
+                    properties:
+                      page:
+                        type: integer
+                      limit:
+                        type: integer
+                      total:
+                        type: integer
+                      totalPages:
+                        type: integer
+    post:
+      summary: เพิ่มข้อมูลนิสิตใหม่ (จำกัด 5 ครั้ง/นาที ต่อ IP)
+      tags: [Students]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, major, email]
+              properties:
+                name:
+                  type: string
+                  minLength: 2
+                  maxLength: 100
+                major:
+                  type: string
+                email:
+                  type: string
+                  format: email
+      responses:
+        "201":
+          description: เพิ่มข้อมูลสำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  data:
+                    $ref: "#/components/schemas/Student"
+        "400":
+          description: ข้อมูลไม่ครบถ้วนหรือไม่ถูกต้อง (VALIDATION_ERROR)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: email ซ้ำกับที่มีอยู่แล้ว (DUPLICATE_EMAIL)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: ส่งคำขอเกินขีดจำกัด (TOO_MANY_REQUESTS)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /students/{id}:
+    get:
+      summary: ดูข้อมูลนิสิตรายบุคคล
+      tags: [Students]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: รหัสนิสิต (student id)
+          example: 1
+          schema:
+            type: integer
+        - name: include
+          in: query
+          description: ระบุ courses เพื่อรวมรายวิชาที่ลงทะเบียนไว้ในผลลัพธ์
+          required: false
+          example: "courses"
+          schema:
+            type: string
+            enum: [courses]
+      responses:
+        "200":
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  data:
+                    $ref: "#/components/schemas/Student"
+        "404":
+          description: ไม่พบข้อมูลนิสิต (NOT_FOUND)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    put:
+      summary: แก้ไขข้อมูลนิสิตทั้งระเบียน (ต้องเป็นเจ้าของระเบียนหรือ admin)
+      tags: [Students]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: รหัสนิสิต (student id) ที่ต้องการแก้ไข
+          example: 1
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, major, email]
+              properties:
+                name:
+                  type: string
+                major:
+                  type: string
+                email:
+                  type: string
+                  format: email
+      responses:
+        "200":
+          description: แก้ไขข้อมูลสำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  data:
+                    $ref: "#/components/schemas/Student"
+        "400":
+          description: ข้อมูลไม่ครบถ้วน (VALIDATION_ERROR)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: ไม่มี token หรือ token ไม่ถูกต้อง (NO_TOKEN / INVALID_TOKEN)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: ไม่ใช่เจ้าของระเบียนและไม่ใช่ admin (FORBIDDEN)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: ไม่พบข้อมูลนิสิต (NOT_FOUND)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: email ซ้ำกับที่มีอยู่แล้ว (DUPLICATE_EMAIL)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      summary: ลบข้อมูลนิสิต (เฉพาะ admin)
+      tags: [Students]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: รหัสนิสิต (student id) ที่ต้องการลบ
+          example: 1
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: ลบข้อมูลสำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+        "401":
+          description: ไม่มี token หรือ token ไม่ถูกต้อง (NO_TOKEN / INVALID_TOKEN)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: ไม่มีสิทธิ์เข้าถึง เนื่องจากไม่ใช่ role admin (FORBIDDEN)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: ไม่พบข้อมูลนิสิต (NOT_FOUND)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /courses:
+    get:
+      summary: รายการรายวิชาทั้งหมด
+      description: ผลลัพธ์ถูก cache ไว้ใน Redis นาน 5 นาที (TTL ยาวกว่ารายการนิสิตเพราะข้อมูลรายวิชาเปลี่ยนไม่บ่อย)
+      tags: [Courses]
+      responses:
+        "200":
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Course"
+    post:
+      summary: เพิ่มรายวิชาใหม่
+      tags: [Courses]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [course_name, credit]
+              properties:
+                course_name:
+                  type: string
+                credit:
+                  type: integer
+                seat_available:
+                  type: integer
+                  default: 30
+      responses:
+        "201":
+          description: เพิ่มข้อมูลสำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  data:
+                    $ref: "#/components/schemas/Course"
+        "400":
+          description: ข้อมูลไม่ครบถ้วน (VALIDATION_ERROR)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /courses/{id}:
+    get:
+      summary: ดูข้อมูลรายวิชารายตัว
+      tags: [Courses]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: รหัสรายวิชา (course id)
+          example: 1
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  data:
+                    $ref: "#/components/schemas/Course"
+        "404":
+          description: ไม่พบข้อมูลรายวิชา (NOT_FOUND)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    put:
+      summary: แก้ไขข้อมูลรายวิชาทั้งระเบียน
+      tags: [Courses]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: รหัสรายวิชา (course id) ที่ต้องการแก้ไข
+          example: 1
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [course_name, credit, seat_available]
+              properties:
+                course_name:
+                  type: string
+                credit:
+                  type: integer
+                seat_available:
+                  type: integer
+      responses:
+        "200":
+          description: แก้ไขข้อมูลสำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  data:
+                    $ref: "#/components/schemas/Course"
+        "400":
+          description: ข้อมูลไม่ครบถ้วน (VALIDATION_ERROR)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: ไม่พบข้อมูลรายวิชา (NOT_FOUND)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      summary: ลบข้อมูลรายวิชา
+      tags: [Courses]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: รหัสรายวิชา (course id) ที่ต้องการลบ
+          example: 1
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: ลบข้อมูลสำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+        "404":
+          description: ไม่พบข้อมูลรายวิชา (NOT_FOUND)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /enrollments:
+    get:
+      summary: รายการลงทะเบียนทั้งหมด (เส้นทางแบบแบน)
+      tags: [Enrollments]
+      responses:
+        "200":
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        student_id:
+                          type: integer
+                        course_id:
+                          type: integer
+
+  /students/{id}/enrollments:
+    post:
+      summary: ลงทะเบียนเรียนรายวิชา (ใช้ Transaction ป้องกันที่นั่งไม่สอดคล้องกัน)
+      tags: [Enrollments]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: รหัสนิสิต (student id) ที่จะลงทะเบียน
+          example: 1
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [courseId]
+              properties:
+                courseId:
+                  type: integer
+      responses:
+        "201":
+          description: ลงทะเบียนสำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+        "404":
+          description: ไม่พบนิสิตหรือรายวิชาที่ระบุ (COURSE_NOT_FOUND / NOT_FOUND)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: ที่นั่งเต็มหรือลงทะเบียนซ้ำ (SEAT_FULL / ALREADY_ENROLLED)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /students/{id}/enrollments/{courseId}:
+    delete:
+      summary: ยกเลิกการลงทะเบียนรายวิชา (คืนที่นั่ง 1 ที่)
+      tags: [Enrollments]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: รหัสนิสิต (student id)
+          example: 1
+          schema:
+            type: integer
+        - name: courseId
+          in: path
+          required: true
+          description: รหัสรายวิชา (course id) ที่ต้องการยกเลิกการลงทะเบียน
+          example: 1
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: ยกเลิกการลงทะเบียนสำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+        "404":
+          description: ไม่พบการลงทะเบียนรายวิชานี้ (NOT_FOUND)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"

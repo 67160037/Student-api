@@ -19,6 +19,15 @@ const {
   generateToken,
 } = require("./auth-helpers");
 
+// สัปดาห์ที่ 12: Validation (Zod) และ Rate Limiter
+const { createStudentSchema } = require("./schemas/studentSchema");
+const { enrollmentSchema } = require("./schemas/enrollmentSchema");
+const {
+  authLimiter,
+  generalLimiter,
+  userLimiter,
+} = require("./middlewares/rateLimiter");
+
 const app = express();
 
 // ลำดับ middleware มีความสำคัญ: security header → CORS → logger → body parser
@@ -31,6 +40,11 @@ app.use(
 );
 app.use(morgan("dev"));
 app.use(express.json({ limit: "10kb" }));
+
+// สัปดาห์ที่ 12: Rate limiter (ต้องอยู่หลัง express.json และก่อน route ทั้งหมด)
+app.set("trust proxy", 1);
+app.use(generalLimiter);
+app.use("/api/v1/auth/login", authLimiter);
 
 app.use(
   "/graphql",
@@ -153,16 +167,21 @@ v1Router.get("/students/:id", async (req, res, next) => {
 
 // 3. POST: เพิ่มข้อมูลนักศึกษาใหม่ พร้อมล้าง Cache แบบกวาดล้างทุกเงื่อนไข (students:*)
 v1Router.post("/students", async (req, res, next) => {
-  const { name, major, email } = req.body;
-
-  if (!name || !major || !email) {
+  // สัปดาห์ที่ 12: ตรวจข้อมูลด้วย Zod (รวม conditional validation ตาม major)
+  const parsed = createStudentSchema.safeParse(req.body);
+  if (!parsed.success) {
     return res.status(400).json({
       error: {
         code: "VALIDATION_ERROR",
-        message: "กรุณาระบุ name, major และ email ให้ครบถ้วน",
+        message: "ข้อมูลที่ส่งมาไม่ถูกต้อง",
+        details: parsed.error.issues.map((issue) => ({
+          field: issue.path.join("."),
+          message: issue.message,
+        })),
       },
     });
   }
+  const { name, major, email } = parsed.data;
 
   try {
     const [result] = await pool.query(
@@ -281,6 +300,7 @@ v1Router.patch("/students/:id", async (req, res, next) => {
 v1Router.delete(
   "/students/:id",
   authenticateToken,
+  userLimiter,
   authorizeRole("admin"),
   async (req, res, next) => {
     try {
@@ -300,12 +320,27 @@ v1Router.delete(
 );
 
 // ข้อมูลผู้ใช้งานที่ล็อกอิน
-v1Router.get("/auth/me", authenticateToken, (req, res) => {
+v1Router.get("/auth/me", authenticateToken, userLimiter, (req, res) => {
   res.status(200).json({ message: "สำเร็จ", data: req.user });
 });
 
 // ลงทะเบียนเรียนด้วย Transaction
 v1Router.post("/students/:id/enrollments", async (req, res, next) => {
+  // [สัปดาห์ที่ 12 ต่อยอดข้อ 1] ตรวจ maxCredits ตาม studentStatus ก่อนขอ connection
+  const enrollParsed = enrollmentSchema.safeParse(req.body ?? {});
+  if (!enrollParsed.success) {
+    return res.status(400).json({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "ข้อมูลที่ส่งมาไม่ถูกต้อง",
+        details: enrollParsed.error.issues.map((issue) => ({
+          field: issue.path.join("."),
+          message: issue.message,
+        })),
+      },
+    });
+  }
+
   const studentId = req.params.id;
   const { courseId } = req.body;
   const connection = await pool.getConnection();
